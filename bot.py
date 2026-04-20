@@ -6,6 +6,7 @@ A moderation, security, and ticket bot for Discord servers.
 import os
 import discord
 from discord.ext import commands
+from dashboard import bot_stats, start_dashboard_thread
 
 # ──────────────────────────────────────────────
 # Bot configuration
@@ -16,12 +17,16 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="Wa!", intents=intents)
 
+# Track whether the dashboard thread has been started
+_dashboard_started = False
+
 # ──────────────────────────────────────────────
 # Events
 # ──────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
+    global _dashboard_started
     print(f"✅  Logged in as {bot.user} (ID: {bot.user.id})")
     # Register persistent views so buttons keep working after restarts
     bot.add_view(TicketPanelView())
@@ -32,6 +37,37 @@ async def on_ready():
             name="over the server 🛡️",
         )
     )
+    # Update shared dashboard stats
+    bot_stats["bot_name"] = bot.user.name
+    bot_stats["bot_avatar"] = str(bot.user.display_avatar.url)
+    bot_stats["guild_count"] = len(bot.guilds)
+    bot_stats["member_count"] = sum(g.member_count or 0 for g in bot.guilds)
+    bot_stats["status"] = "online"
+    # Start the web dashboard (only once across reconnects)
+    if not _dashboard_started:
+        _dashboard_started = True
+        start_dashboard_thread()
+        print("🌐  Dashboard running on http://localhost:5000")
+
+
+@bot.event
+async def on_command(ctx):
+    """Count every successfully invoked command."""
+    bot_stats["command_count"] += 1
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Keep guild/member counts up to date."""
+    bot_stats["guild_count"] = len(bot.guilds)
+    bot_stats["member_count"] = sum(g.member_count or 0 for g in bot.guilds)
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    """Keep guild/member counts up to date."""
+    bot_stats["guild_count"] = len(bot.guilds)
+    bot_stats["member_count"] = sum(g.member_count or 0 for g in bot.guilds)
 
 
 @bot.event

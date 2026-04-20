@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WondeX Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">
+      <span class="bot-dot" id="nav-dot"></span>
+      WondeX
+    </div>
+    <div class="nav-links">
+      <a href="/" class="active">Dashboard</a>
+      <a href="/commands">Commands</a>
+    </div>
+  </nav>
+
+  <main class="container">
+    <section class="hero">
+      <div class="bot-avatar-wrap">
+        <img id="bot-avatar" src="" alt="" class="bot-avatar hidden" />
+        <div class="bot-avatar-placeholder" id="bot-avatar-placeholder">W</div>
+      </div>
+      <h1 id="bot-name">WondeX</h1>
+      <p>Real-time stats for your Discord moderation &amp; support bot.</p>
+      <span class="badge" id="status-badge">● Connecting…</span>
+    </section>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-icon">🏠</div>
+        <div class="stat-value" id="guild-count">—</div>
+        <div class="stat-label">Servers</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon">👥</div>
+        <div class="stat-value" id="member-count">—</div>
+        <div class="stat-label">Members</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon">⚙️</div>
+        <div class="stat-value" id="command-count">—</div>
+        <div class="stat-label">Commands Run</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon">⏱️</div>
+        <div class="stat-value" id="uptime">—</div>
+        <div class="stat-label">Uptime</div>
+      </div>
+    </div>
+
+    <p class="refresh-hint">Stats refresh automatically every 30 seconds.</p>
+  </main>
+
+  <footer class="footer">
+    <p>WondeX Bot &copy; 2024 &mdash; Built with discord.py &amp; Flask</p>
+  </footer>
+
+  <script>
+    async function fetchStats() {
+      try {
+        const res = await fetch('/api/stats');
+        const d = await res.json();
+
+        document.getElementById('guild-count').textContent = d.guild_count;
+        document.getElementById('member-count').textContent = Number(d.member_count).toLocaleString();
+        document.getElementById('command-count').textContent = Number(d.command_count).toLocaleString();
+        document.getElementById('uptime').textContent = d.uptime;
+
+        if (d.bot_name) document.getElementById('bot-name').textContent = d.bot_name;
+
+        const avatar = document.getElementById('bot-avatar');
+        const placeholder = document.getElementById('bot-avatar-placeholder');
+        if (d.bot_avatar) {
+          avatar.src = d.bot_avatar;
+          avatar.classList.remove('hidden');
+          placeholder.classList.add('hidden');
+        }
+
+        const dot = document.getElementById('nav-dot');
+        const badge = document.getElementById('status-badge');
+        if (d.status === 'online') {
+          dot.classList.add('online');
+          badge.textContent = '● Online';
+          badge.className = 'badge online';
+        } else {
+          dot.classList.remove('online');
+          badge.textContent = '● Offline';
+          badge.className = 'badge offline';
+        }
+      } catch (e) {
+        console.error('Could not fetch stats:', e);
+      }
+    }
+
+    fetchStats();
+    setInterval(fetchStats, 30000);
+  </script>
+</body>
+</html>
