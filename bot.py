@@ -3,10 +3,14 @@ WondeX Discord Bot
 A moderation, security, and ticket bot for Discord servers.
 """
 
+import asyncio
 import os
 import discord
 from discord.ext import commands
 from dashboard import bot_stats, start_dashboard_thread
+
+# Graceful shutdown after this many seconds (just under the 355-min workflow timeout)
+_RUNTIME_SECONDS = 350 * 60
 
 # ──────────────────────────────────────────────
 # Bot configuration
@@ -19,6 +23,17 @@ bot = commands.Bot(command_prefix="Wa!", intents=intents)
 
 # Track whether the dashboard thread has been started
 _dashboard_started = False
+
+# ──────────────────────────────────────────────
+# Graceful shutdown helper
+# ──────────────────────────────────────────────
+
+async def _shutdown_after(seconds: int) -> None:
+    """Wait *seconds* then close the bot so the workflow exits cleanly."""
+    await asyncio.sleep(seconds)
+    print(f"⏰  Scheduled runtime of {seconds // 60} minutes reached — shutting down gracefully.")
+    await bot.close()
+
 
 # ──────────────────────────────────────────────
 # Events
@@ -48,6 +63,9 @@ async def on_ready():
         _dashboard_started = True
         start_dashboard_thread()
         print("🌐  Dashboard running on http://localhost:5000")
+        # Schedule a graceful shutdown just before the workflow timeout so the
+        # job exits with code 0 (completed) rather than being killed.
+        bot.loop.create_task(_shutdown_after(_RUNTIME_SECONDS))
 
 
 @bot.event
@@ -244,7 +262,8 @@ async def serverinfo(ctx):
         description=guild.description or "No description.",
         color=discord.Color.blurple(),
     )
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else discord.Embed.Empty)
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
     embed.add_field(name="Owner", value=str(guild.owner), inline=True)
     embed.add_field(name="Members", value=guild.member_count, inline=True)
     embed.add_field(name="Channels", value=len(guild.channels), inline=True)
