@@ -10,11 +10,11 @@ Developed by **wantedpebkkk** — created because many servers lack proper secur
 
 | Category | Commands |
 |---|---|
-| 🔨 **Moderation** | `!kick`, `!ban`, `!unban`, `!mute`, `!unmute`, `!warn`, `!purge` |
-| 🛡️ **Security** | `!lockdown`, `!unlock`, `!serverinfo`, `!userinfo` |
-| 🎫 **Tickets** | `!ticket [topic]`, `!closeticket` |
+| 🔨 **Moderation** | `Wa!kick`, `Wa!ban`, `Wa!unban`, `Wa!mute`, `Wa!unmute`, `Wa!warn`, `Wa!purge` |
+| 🛡️ **Security** | `Wa!lockdown`, `Wa!unlock`, `Wa!serverinfo`, `Wa!userinfo` |
+| 🎫 **Tickets** | `Wa!ticketpanel` (staff) → members click **Open Ticket 🎫** button → **Close 🔒 / Claim 👋** buttons |
 
-Default prefix: **`!`**
+Default prefix: **`Wa!`**
 
 ---
 

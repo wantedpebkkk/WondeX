@@ -15,7 +15,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="Wa!", intents=intents)
 
 # ──────────────────────────────────────────────
 # Events
@@ -24,6 +24,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"✅  Logged in as {bot.user} (ID: {bot.user.id})")
+    # Register persistent views so buttons keep working after restarts
+    bot.add_view(TicketPanelView())
+    bot.add_view(CloseClaimView())
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
@@ -232,61 +235,131 @@ async def userinfo(ctx, member: discord.Member = None):
 
 
 # ──────────────────────────────────────────────
-# Ticket system
+# Ticket system — Xieron-style button panel
 # ──────────────────────────────────────────────
 
 TICKET_CATEGORY_NAME = "Tickets"
 
 
-@bot.command(name="ticket")
-async def ticket(ctx, *, topic: str = "Support"):
-    """Open a new support ticket channel."""
-    guild = ctx.guild
-    category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
-    if not category:
-        category = await guild.create_category(TICKET_CATEGORY_NAME)
+class CloseClaimView(discord.ui.View):
+    """Persistent view shown inside every ticket channel."""
 
-    channel_name = f"ticket-{ctx.author.name.lower().replace(' ', '-')}"
-    existing = discord.utils.get(category.channels, name=channel_name)
-    if existing:
-        await ctx.send(f"You already have an open ticket: {existing.mention}")
-        return
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        ctx.author: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-    }
-    channel = await category.create_text_channel(channel_name, overwrites=overwrites)
-
-    embed = discord.Embed(
-        title=f"Ticket: {topic}",
-        description=(
-            f"Hello {ctx.author.mention}! Staff will assist you shortly.\n"
-            "Use `!closeticket` when your issue is resolved."
-        ),
-        color=discord.Color.blurple(),
+    @discord.ui.button(
+        label="Close Ticket 🔒",
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket:close",
     )
-    await channel.send(embed=embed)
-    await ctx.send(f"✅ Your ticket has been created: {channel.mention}")
-
-
-@bot.command(name="closeticket")
-async def closeticket(ctx):
-    """Close the current ticket channel."""
-    if (
-        ctx.channel.category
-        and ctx.channel.category.name == TICKET_CATEGORY_NAME
+    async def close_ticket(
+        self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         embed = discord.Embed(
             title="Ticket Closed",
-            description="This ticket has been closed and will be deleted shortly.",
+            description="This ticket has been closed and will be deleted in 5 seconds.",
             color=discord.Color.red(),
         )
-        await ctx.send(embed=embed)
-        await ctx.channel.delete(delay=5)
-    else:
-        await ctx.send("This command can only be used inside a ticket channel.")
+        await interaction.response.send_message(embed=embed)
+        await interaction.channel.delete(delay=5)
+
+    @discord.ui.button(
+        label="Claim 👋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="ticket:claim",
+    )
+    async def claim_ticket(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not interaction.user.guild_permissions.manage_channels:
+            await interaction.response.send_message(
+                "❌ Only staff can claim tickets.", ephemeral=True
+            )
+            return
+        await interaction.channel.set_permissions(
+            interaction.user,
+            view_channel=True,
+            send_messages=True,
+            manage_messages=True,
+        )
+        await interaction.response.send_message(
+            f"✅ {interaction.user.mention} has claimed this ticket."
+        )
+        button.disabled = True
+        await interaction.message.edit(view=self)
+
+
+class TicketPanelView(discord.ui.View):
+    """Persistent view shown in the ticket panel channel."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Open Ticket 🎫",
+        style=discord.ButtonStyle.primary,
+        custom_id="ticket:open",
+    )
+    async def open_ticket(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        guild = interaction.guild
+        user = interaction.user
+
+        category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+        if not category:
+            category = await guild.create_category(TICKET_CATEGORY_NAME)
+
+        channel_name = f"ticket-{user.name.lower().replace(' ', '-')}"
+        existing = discord.utils.get(category.channels, name=channel_name)
+        if existing:
+            await interaction.response.send_message(
+                f"You already have an open ticket: {existing.mention}",
+                ephemeral=True,
+            )
+            return
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, manage_channels=True
+            ),
+        }
+        channel = await category.create_text_channel(channel_name, overwrites=overwrites)
+
+        embed = discord.Embed(
+            title="🎫 Support Ticket",
+            description=(
+                f"Welcome {user.mention}! Please describe your issue and staff will assist you shortly.\n\n"
+                "Click **Close Ticket 🔒** when your issue is resolved.\n"
+                "Staff can click **Claim 👋** to take ownership of this ticket."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=f"Ticket opened by {user}")
+        await channel.send(embed=embed, view=CloseClaimView())
+
+        await interaction.response.send_message(
+            f"✅ Your ticket has been created: {channel.mention}", ephemeral=True
+        )
+
+
+@bot.command(name="ticketpanel")
+@commands.has_permissions(manage_channels=True)
+async def ticketpanel(ctx):
+    """Post the ticket panel embed with an Open Ticket button."""
+    embed = discord.Embed(
+        title="🎫 Support Tickets",
+        description=(
+            "Need help or have a question? Click the button below to open a private support ticket.\n\n"
+            "A dedicated channel will be created just for you."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text=f"{ctx.guild.name} Support")
+    await ctx.send(embed=embed, view=TicketPanelView())
+    await ctx.message.delete()
 
 
 # ──────────────────────────────────────────────
@@ -301,37 +374,38 @@ async def help_command(ctx):
     """Show all available commands."""
     embed = discord.Embed(
         title="WondeX Bot Commands",
-        description="Prefix: `!`",
+        description="Prefix: `Wa!`",
         color=discord.Color.blurple(),
     )
     embed.add_field(
         name="🔨 Moderation",
         value=(
-            "`!kick <member> [reason]`\n"
-            "`!ban <member> [reason]`\n"
-            "`!unban <user#tag>`\n"
-            "`!mute <member> [reason]`\n"
-            "`!unmute <member>`\n"
-            "`!warn <member> [reason]`\n"
-            "`!purge <amount>`"
+            "`Wa!kick <member> [reason]`\n"
+            "`Wa!ban <member> [reason]`\n"
+            "`Wa!unban <user#tag>`\n"
+            "`Wa!mute <member> [reason]`\n"
+            "`Wa!unmute <member>`\n"
+            "`Wa!warn <member> [reason]`\n"
+            "`Wa!purge <amount>`"
         ),
         inline=False,
     )
     embed.add_field(
         name="🛡️ Security",
         value=(
-            "`!lockdown`\n"
-            "`!unlock`\n"
-            "`!serverinfo`\n"
-            "`!userinfo [member]`"
+            "`Wa!lockdown`\n"
+            "`Wa!unlock`\n"
+            "`Wa!serverinfo`\n"
+            "`Wa!userinfo [member]`"
         ),
         inline=False,
     )
     embed.add_field(
         name="🎫 Tickets",
         value=(
-            "`!ticket [topic]`\n"
-            "`!closeticket`"
+            "`Wa!ticketpanel` — post the ticket panel (staff only)\n"
+            "Members click **Open Ticket 🎫** to create a private ticket\n"
+            "Inside the ticket: **Close Ticket 🔒** or **Claim 👋**"
         ),
         inline=False,
     )
