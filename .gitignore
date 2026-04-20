@@ -12,4 +12,3 @@ pip-delete-this-directory.txt
 *.egg-info/
 dist/
 build/
-__pycache__/

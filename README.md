@@ -20,7 +20,7 @@ Default prefix: **`!`**
 
 ## 🚀 Free Hosting on GitHub (no VPS needed)
 
-The bot runs inside **GitHub Actions**, which is completely free for public repositories and gives you 2 000 free minutes/month on private repos. A scheduled workflow restarts the bot every 6 hours to stay within GitHub's job time limit.
+The bot runs inside **GitHub Actions**, which is completely free for public repositories and gives you 2,000 free minutes/month on private repos. A scheduled workflow restarts the bot every 6 hours to stay within GitHub's job time limit.
 
 ### Step 1 — Fork this repository
 
