@@ -73,6 +73,7 @@ async def on_guild_remove(guild: discord.Guild):
 @bot.event
 async def on_member_join(member: discord.Member):
     """Send a welcome message when a new member joins."""
+    bot_stats["member_count"] = sum(g.member_count or 0 for g in bot.guilds)
     channel = discord.utils.get(member.guild.text_channels, name="general")
     if channel:
         embed = discord.Embed(
