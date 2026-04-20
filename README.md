@@ -46,21 +46,7 @@ Click **Fork** at the top-right of this page so you own a copy.
 2. If prompted, click **I understand my workflows, go ahead and enable them**.
 3. Click on **Run WondeX Discord Bot** → **Run workflow** to start the bot immediately.
 
-The workflow also runs automatically every 6 hours via a cron schedule, and an **auto-restart** workflow immediately re-launches the bot the moment a run ends — so downtime between restarts is near zero.
-
----
-
-## 🌐 Keeping the bot truly 24/7 (UptimeRobot)
-
-The bot runs a tiny Flask web server on port 8080 (`keep_alive.py`).  
-To prevent any platform from suspending the process, set up a **free uptime monitor** to ping it every 5 minutes:
-
-1. Sign up at <https://uptimerobot.com> (free tier is enough).
-2. Click **+ Add New Monitor**.
-3. Choose **HTTP(s)** as the monitor type.
-4. Set the **URL** to the public address of your running bot (e.g. the GitHub Codespace / ngrok URL, or a self-hosted URL).
-5. Set **Monitoring Interval** to **5 minutes**.
-6. Save — UptimeRobot will now ping `GET /` every 5 minutes and alert you if the bot goes down.
+The workflow also runs automatically every 6 hours via a cron schedule, and the **`restart.yml`** workflow immediately re-launches the bot the moment a run ends — so the bot is back online within ~30 seconds, with no pinging or external services required.
 
 ---
 
@@ -89,7 +75,6 @@ python bot.py
 ```
 WondeX/
 ├── bot.py                        # Main bot code
-├── keep_alive.py                 # Tiny Flask server (keeps the process alive)
 ├── requirements.txt              # Python dependencies
 ├── .env.example                  # Template for environment variables
 ├── .gitignore                    # Keeps secrets & caches out of git

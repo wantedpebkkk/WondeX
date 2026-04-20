@@ -6,7 +6,6 @@ A moderation, security, and ticket bot for Discord servers.
 import os
 import discord
 from discord.ext import commands
-from keep_alive import keep_alive
 
 # ──────────────────────────────────────────────
 # Bot configuration
@@ -435,7 +434,6 @@ async def on_command_error(ctx, error):
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    keep_alive()
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError(
