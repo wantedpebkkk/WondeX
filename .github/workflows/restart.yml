@@ -1,0 +1,23 @@
+name: Auto-restart WondeX Bot
+
+on:
+  # Fire every time the main bot workflow finishes (for any reason)
+  workflow_run:
+    workflows: ["Run WondeX Discord Bot"]
+    types:
+      - completed
+
+jobs:
+  restart:
+    name: Restart Bot
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # needed to dispatch the bot workflow
+    steps:
+      - name: Re-dispatch bot workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run bot.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.event.workflow_run.head_branch }}"

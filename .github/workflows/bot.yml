@@ -1,0 +1,36 @@
+name: Run WondeX Discord Bot
+
+on:
+  # Allow manual trigger from the GitHub Actions UI
+  workflow_dispatch:
+  # Auto-restart every 6 hours (GitHub Actions jobs time out after 6 h)
+  schedule:
+    - cron: "0 */6 * * *"
+
+jobs:
+  run-bot:
+    name: Run Bot
+    runs-on: ubuntu-latest
+    # Limit GITHUB_TOKEN permissions to the minimum required
+    permissions:
+      contents: read
+    # Keep going for up to 355 minutes (just under the 6-hour limit)
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run WondeX bot
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+        run: python bot.py
