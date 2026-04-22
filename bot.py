@@ -4,7 +4,10 @@ A moderation, security, and ticket bot for Discord servers.
 """
 
 import asyncio
+import collections
+import datetime
 import os
+import time
 import discord
 from discord.ext import commands
 from dashboard import bot_stats, start_dashboard_thread
@@ -18,6 +21,7 @@ _RUNTIME_SECONDS = 350 * 60
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.moderation = True  # Required for on_audit_log_entry_create
 
 bot = commands.Bot(command_prefix="Wa!", intents=intents)
 
@@ -290,6 +294,180 @@ async def userinfo(ctx, member: discord.Member = None):
 
 
 # ──────────────────────────────────────────────
+# Anti-nuke system — Xieron-style protection
+# ──────────────────────────────────────────────
+
+# Per-guild config: {guild_id: {"enabled": bool, "whitelist": set[int]}}
+_antinuke_config: dict[int, dict] = {}
+
+# Recent action tracking: {guild_id: {user_id: {action_name: [unix_timestamps]}}}
+_action_log: dict = collections.defaultdict(
+    lambda: collections.defaultdict(lambda: collections.defaultdict(list))
+)
+
+# (max_count, time_window_seconds) for each watched audit log action
+_AN_THRESHOLDS: dict[discord.AuditLogAction, tuple[int, int]] = {
+    discord.AuditLogAction.ban:            (3, 10),
+    discord.AuditLogAction.kick:           (3, 10),
+    discord.AuditLogAction.channel_delete: (2, 10),
+    discord.AuditLogAction.role_delete:    (2, 10),
+    discord.AuditLogAction.webhook_create: (1, 10),
+}
+
+
+def _get_antinuke_cfg(guild_id: int) -> dict:
+    if guild_id not in _antinuke_config:
+        _antinuke_config[guild_id] = {"enabled": False, "whitelist": set()}
+    return _antinuke_config[guild_id]
+
+
+async def _punish_nuker(
+    guild: discord.Guild,
+    user: discord.abc.User,
+    action_label: str,
+) -> None:
+    """Strip all roles from and ban the detected nuker, then log the event."""
+    member = guild.get_member(user.id)
+    if member is None:
+        return
+    # Never punish the server owner or the bot itself
+    if member.id in (guild.owner_id, guild.me.id):
+        return
+    try:
+        roles_to_strip = [
+            r for r in member.roles
+            if r != guild.default_role and r.is_assignable()
+        ]
+        if roles_to_strip:
+            await member.remove_roles(
+                *roles_to_strip, reason="[Anti-Nuke] Mass destructive action"
+            )
+        await guild.ban(
+            member,
+            reason="[Anti-Nuke] Mass destructive action detected",
+            delete_message_days=0,
+        )
+    except discord.Forbidden:
+        pass
+
+    # Alert in mod-log / logs / system channel (whichever exists first)
+    log_ch = (
+        discord.utils.get(guild.text_channels, name="mod-log")
+        or discord.utils.get(guild.text_channels, name="logs")
+        or discord.utils.get(guild.text_channels, name="audit-log")
+        or guild.system_channel
+    )
+    if log_ch:
+        embed = discord.Embed(
+            title="🚨 Anti-Nuke Triggered",
+            description=(
+                f"**User:** {user.mention} (`{user}`)\n"
+                f"**Suspicious Action:** `{action_label}`\n"
+                f"**Action Taken:** Roles stripped & banned"
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.set_footer(text="WondeX Anti-Nuke")
+        try:
+            await log_ch.send(embed=embed)
+        except discord.Forbidden:
+            pass
+
+
+@bot.event
+async def on_audit_log_entry_create(entry: discord.AuditLogEntry) -> None:
+    """Monitor audit log entries and trigger anti-nuke when thresholds are exceeded."""
+    guild = entry.guild
+    cfg = _get_antinuke_cfg(guild.id)
+    if not cfg["enabled"] or entry.action not in _AN_THRESHOLDS:
+        return
+
+    user = entry.user
+    if user is None or user.id in (guild.owner_id, guild.me.id):
+        return
+    if user.id in cfg["whitelist"]:
+        return
+
+    limit, window = _AN_THRESHOLDS[entry.action]
+    now = time.time()
+    action_key = entry.action.name
+    timestamps = _action_log[guild.id][user.id][action_key]
+
+    # Prune entries outside the time window
+    timestamps[:] = [t for t in timestamps if now - t < window]
+    timestamps.append(now)
+
+    if len(timestamps) >= limit:
+        timestamps.clear()
+        await _punish_nuker(guild, user, action_key)
+
+
+# ─── Anti-nuke commands ────────────────────────
+
+@bot.group(name="antinuke", invoke_without_command=True)
+@commands.has_permissions(administrator=True)
+async def antinuke_group(ctx):
+    """Show anti-nuke status. Use subcommands: on, off, whitelist."""
+    cfg = _get_antinuke_cfg(ctx.guild.id)
+    status = "✅ Enabled" if cfg["enabled"] else "❌ Disabled"
+    wl = ", ".join(f"<@{uid}>" for uid in cfg["whitelist"]) or "None"
+    embed = discord.Embed(
+        title="🛡️ Anti-Nuke Status",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Status", value=status, inline=False)
+    embed.add_field(name="Whitelisted Users", value=wl, inline=False)
+    embed.add_field(
+        name="Thresholds",
+        value=(
+            "• **Ban / Kick:** 3 actions in 10 s\n"
+            "• **Channel / Role Delete:** 2 actions in 10 s\n"
+            "• **Webhook Create:** 1 in 10 s"
+        ),
+        inline=False,
+    )
+    await ctx.send(embed=embed)
+
+
+@antinuke_group.command(name="on")
+@commands.has_permissions(administrator=True)
+async def antinuke_on(ctx):
+    """Enable anti-nuke protection."""
+    _get_antinuke_cfg(ctx.guild.id)["enabled"] = True
+    await ctx.send("✅ Anti-nuke protection **enabled**.")
+
+
+@antinuke_group.command(name="off")
+@commands.has_permissions(administrator=True)
+async def antinuke_off(ctx):
+    """Disable anti-nuke protection."""
+    _get_antinuke_cfg(ctx.guild.id)["enabled"] = False
+    await ctx.send("❌ Anti-nuke protection **disabled**.")
+
+
+@antinuke_group.command(name="whitelist")
+@commands.has_permissions(administrator=True)
+async def antinuke_whitelist(ctx, action: str, member: discord.Member):
+    """Add or remove a user from the anti-nuke whitelist.
+
+    Usage:
+      Wa!antinuke whitelist add @user
+      Wa!antinuke whitelist remove @user
+    """
+    cfg = _get_antinuke_cfg(ctx.guild.id)
+    action = action.lower()
+    if action == "add":
+        cfg["whitelist"].add(member.id)
+        await ctx.send(f"✅ {member.mention} added to the anti-nuke whitelist.")
+    elif action in ("remove", "del"):
+        cfg["whitelist"].discard(member.id)
+        await ctx.send(f"✅ {member.mention} removed from the anti-nuke whitelist.")
+    else:
+        await ctx.send("❌ Invalid action. Use `add` or `remove`.")
+
+
+# ──────────────────────────────────────────────
 # Ticket system — Xieron-style button panel
 # ──────────────────────────────────────────────
 
@@ -461,6 +639,17 @@ async def help_command(ctx):
             "`Wa!ticketpanel` — post the ticket panel (staff only)\n"
             "Members click **Open Ticket 🎫** to create a private ticket\n"
             "Inside the ticket: **Close Ticket 🔒** or **Claim 👋**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ Anti-Nuke",
+        value=(
+            "`Wa!antinuke` — show current status & thresholds\n"
+            "`Wa!antinuke on` — enable protection\n"
+            "`Wa!antinuke off` — disable protection\n"
+            "`Wa!antinuke whitelist add/remove @user` — manage whitelist\n\n"
+            "**Protects against:** mass ban, mass kick, mass channel/role delete, webhook spam"
         ),
         inline=False,
     )
