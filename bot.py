@@ -1102,6 +1102,27 @@ async def ticketpanel(ctx):
 
 
 # ──────────────────────────────────────────────
+# Bot restart command
+# ──────────────────────────────────────────────
+
+@bot.command(name="restart")
+@commands.has_permissions(administrator=True)
+async def restart_bot(ctx):
+    """Gracefully restart the bot (administrator only).
+
+    Closes the current instance; the Auto-restart workflow will
+    immediately spin up a fresh one.
+    """
+    embed = discord.Embed(
+        title="🔄 Restarting...",
+        description="The bot is shutting down and will restart automatically in a few seconds.",
+        color=discord.Color.orange(),
+    )
+    await ctx.send(embed=embed)
+    await bot.close()
+
+
+# ──────────────────────────────────────────────
 # Help command
 # ──────────────────────────────────────────────
 
@@ -1178,6 +1199,11 @@ async def help_command(ctx):
             "• Anti-spam (5 msg / 5s → auto-mute)\n"
             "• Anti-raid (10 joins / 10s → full lockdown)"
         ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚙️ Bot Management",
+        value="`Wa!restart` — gracefully restart the bot (admin only)",
         inline=False,
     )
     await ctx.send(embed=embed)
