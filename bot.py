@@ -6,6 +6,7 @@ A moderation, security, and ticket bot for Discord servers.
 import asyncio
 import collections
 import datetime
+import re
 import os
 import time
 import discord
@@ -27,6 +28,53 @@ bot = commands.Bot(command_prefix="Wa!", intents=intents)
 
 # Track whether the dashboard thread has been started
 _dashboard_started = False
+
+# ──────────────────────────────────────────────
+# Shared per-guild configuration
+# ──────────────────────────────────────────────
+
+# Mod-log channel: {guild_id: channel_id}
+_modlog_channels: dict[int, int] = {}
+
+# Auto-role: {guild_id: role_id}
+_autorole: dict[int, int] = {}
+
+# Warning store: {guild_id: {user_id: [reason, ...]}}
+_warnings: dict[int, dict[int, list[str]]] = collections.defaultdict(
+    lambda: collections.defaultdict(list)
+)
+
+# Anti-spam: {guild_id: {user_id: [unix_timestamps]}}
+_spam_log: dict[int, dict[int, list[float]]] = collections.defaultdict(
+    lambda: collections.defaultdict(list)
+)
+
+# Anti-invite toggle: {guild_id: bool}
+_antiinvite: dict[int, bool] = {}
+
+# Anti-raid: {guild_id: [join_unix_timestamps]}
+_raid_log: dict[int, list[float]] = collections.defaultdict(list)
+
+# Regex matching common Discord invite links
+_INVITE_RE = re.compile(
+    r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/[a-zA-Z0-9\-]+",
+    re.IGNORECASE,
+)
+
+# Anti-spam thresholds
+_SPAM_LIMIT = 5       # messages
+_SPAM_WINDOW = 5      # seconds
+
+# Anti-raid thresholds
+_RAID_LIMIT = 10      # joins
+_RAID_WINDOW = 10     # seconds
+
+# Maximum Discord slowmode in seconds (28 days worth of minutes in seconds = 21600 s max)
+_MAX_SLOWMODE_SECONDS = 21600
+
+# Auto-punish warns threshold
+_WARN_AUTO_MUTE = 3
+_WARN_AUTO_BAN = 5
 
 # ──────────────────────────────────────────────
 # Graceful shutdown helper
@@ -94,17 +142,157 @@ async def on_guild_remove(guild: discord.Guild):
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Send a welcome message when a new member joins."""
+    """Send a welcome message, assign auto-role, and check for raids."""
+    guild = member.guild
     bot_stats["member_count"] = sum(g.member_count or 0 for g in bot.guilds)
-    channel = discord.utils.get(member.guild.text_channels, name="general")
+
+    # ── Welcome message ──────────────────────────
+    channel = discord.utils.get(guild.text_channels, name="general")
     if channel:
         embed = discord.Embed(
-            title=f"Welcome to {member.guild.name}! 🎉",
+            title=f"Welcome to {guild.name}! 🎉",
             description=f"Hey {member.mention}, welcome aboard! Please read the rules.",
             color=discord.Color.green(),
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         await channel.send(embed=embed)
+
+    # ── Auto-role ────────────────────────────────
+    role_id = _autorole.get(guild.id)
+    if role_id:
+        role = guild.get_role(role_id)
+        if role:
+            try:
+                await member.add_roles(role, reason="Auto-role on join")
+            except discord.Forbidden:
+                pass
+
+    # ── Anti-raid ────────────────────────────────
+    now = time.time()
+    joins = _raid_log[guild.id]
+    joins[:] = [t for t in joins if now - t < _RAID_WINDOW]
+    joins.append(now)
+    if len(joins) >= _RAID_LIMIT:
+        joins.clear()
+        # Lock every text channel for @everyone
+        for ch in guild.text_channels:
+            try:
+                ow = ch.overwrites_for(guild.default_role)
+                ow.send_messages = False
+                await ch.set_permissions(guild.default_role, overwrite=ow)
+            except discord.Forbidden:
+                pass
+        await _send_modlog(
+            guild,
+            discord.Embed(
+                title="🚨 Anti-Raid Triggered",
+                description=(
+                    f"**{_RAID_LIMIT}+ members** joined within **{_RAID_WINDOW}s**.\n"
+                    "All channels have been locked. Use `Wa!unlock` to restore them."
+                ),
+                color=discord.Color.red(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            ).set_footer(text="WondeX Anti-Raid"),
+        )
+
+
+# ──────────────────────────────────────────────
+# Mod-log helper
+# ──────────────────────────────────────────────
+
+async def _send_modlog(guild: discord.Guild, embed: discord.Embed) -> None:
+    """Send *embed* to the configured mod-log channel (or fallback channels)."""
+    ch_id = _modlog_channels.get(guild.id)
+    ch = guild.get_channel(ch_id) if ch_id else None
+    if ch is None:
+        ch = (
+            discord.utils.get(guild.text_channels, name="mod-log")
+            or discord.utils.get(guild.text_channels, name="logs")
+            or discord.utils.get(guild.text_channels, name="audit-log")
+        )
+    if ch:
+        try:
+            await ch.send(embed=embed)
+        except discord.Forbidden:
+            pass
+
+
+# ──────────────────────────────────────────────
+# Anti-spam & anti-invite (on_message)
+# ──────────────────────────────────────────────
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    """Run anti-spam and anti-invite checks before processing commands."""
+    if message.author.bot or not message.guild:
+        await bot.process_commands(message)
+        return
+
+    guild = message.guild
+    author = message.author
+
+    # ── Anti-invite ──────────────────────────────
+    if _antiinvite.get(guild.id) and _INVITE_RE.search(message.content):
+        # Allow administrators to post invites freely
+        if not author.guild_permissions.administrator:
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            try:
+                await author.send(
+                    f"⚠️ Posting invite links is not allowed in **{guild.name}**."
+                )
+            except discord.Forbidden:
+                pass
+            await _send_modlog(
+                guild,
+                discord.Embed(
+                    title="🔗 Invite Link Removed",
+                    description=(
+                        f"**User:** {author.mention} (`{author}`)\n"
+                        f"**Channel:** {message.channel.mention}"
+                    ),
+                    color=discord.Color.orange(),
+                    timestamp=datetime.datetime.now(datetime.timezone.utc),
+                ).set_footer(text="WondeX Anti-Invite"),
+            )
+            return  # don't process commands from deleted messages
+
+    # ── Anti-spam ────────────────────────────────
+    now = time.time()
+    log = _spam_log[guild.id][author.id]
+    log[:] = [t for t in log if now - t < _SPAM_WINDOW]
+    log.append(now)
+    if len(log) >= _SPAM_LIMIT:
+        log.clear()
+        muted_role = discord.utils.get(guild.roles, name="Muted")
+        if not muted_role:
+            try:
+                muted_role = await guild.create_role(name="Muted")
+                for ch in guild.channels:
+                    await ch.set_permissions(muted_role, send_messages=False, speak=False)
+            except discord.Forbidden:
+                muted_role = None
+        if muted_role:
+            try:
+                await author.add_roles(muted_role, reason="[Anti-Spam] Message flood detected")
+            except discord.Forbidden:
+                pass
+        await _send_modlog(
+            guild,
+            discord.Embed(
+                title="🚫 Anti-Spam Triggered",
+                description=(
+                    f"**User:** {author.mention} (`{author}`)\n"
+                    f"**Action:** Auto-muted for sending {_SPAM_LIMIT}+ messages in {_SPAM_WINDOW}s"
+                ),
+                color=discord.Color.orange(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            ).set_footer(text="WondeX Anti-Spam"),
+        )
+
+    await bot.process_commands(message)
 
 
 # ──────────────────────────────────────────────
@@ -195,20 +383,60 @@ async def unmute(ctx, member: discord.Member):
 @bot.command(name="warn")
 @commands.has_permissions(manage_messages=True)
 async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided"):
-    """Warn a member via DM and log in the channel."""
+    """Warn a member via DM and log in the channel. Auto-mutes at 3, auto-bans at 5."""
+    _warnings[ctx.guild.id][member.id].append(reason)
+    total = len(_warnings[ctx.guild.id][member.id])
     try:
         await member.send(
-            f"⚠️ You have been warned in **{ctx.guild.name}**.\n**Reason:** {reason}"
+            f"⚠️ You have been warned in **{ctx.guild.name}**.\n**Reason:** {reason}\n"
+            f"You now have **{total}** warning(s)."
         )
     except discord.Forbidden:
         pass
 
     embed = discord.Embed(
-        title="Member Warned",
-        description=f"**{member}** has been warned.\n**Reason:** {reason}",
+        title="⚠️ Member Warned",
+        description=(
+            f"**{member}** has been warned.\n"
+            f"**Reason:** {reason}\n"
+            f"**Total warnings:** {total}"
+        ),
         color=discord.Color.yellow(),
     )
     await ctx.send(embed=embed)
+    await _send_modlog(
+        ctx.guild,
+        discord.Embed(
+            title="⚠️ Warn",
+            description=(
+                f"**User:** {member.mention} (`{member}`)\n"
+                f"**By:** {ctx.author.mention}\n"
+                f"**Reason:** {reason}\n"
+                f"**Total warnings:** {total}"
+            ),
+            color=discord.Color.yellow(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        ).set_footer(text="WondeX Mod-Log"),
+    )
+
+    # Auto-punish on threshold
+    if total >= _WARN_AUTO_BAN:
+        try:
+            await member.ban(reason=f"[Auto-Ban] Reached {_WARN_AUTO_BAN} warnings")
+            await ctx.send(f"🔨 {member.mention} was **auto-banned** for reaching {_WARN_AUTO_BAN} warnings.")
+        except discord.Forbidden:
+            pass
+    elif total >= _WARN_AUTO_MUTE:
+        muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
+        if not muted_role:
+            muted_role = await ctx.guild.create_role(name="Muted")
+            for channel in ctx.guild.channels:
+                await channel.set_permissions(muted_role, send_messages=False, speak=False)
+        try:
+            await member.add_roles(muted_role, reason=f"[Auto-Mute] Reached {_WARN_AUTO_MUTE} warnings")
+            await ctx.send(f"🔇 {member.mention} was **auto-muted** for reaching {_WARN_AUTO_MUTE} warnings.")
+        except discord.Forbidden:
+            pass
 
 
 @bot.command(name="purge")
@@ -221,6 +449,284 @@ async def purge(ctx, amount: int):
     deleted = await ctx.channel.purge(limit=amount + 1)
     msg = await ctx.send(f"🗑️ Deleted {len(deleted) - 1} messages.")
     await msg.delete(delay=3)
+
+
+@bot.command(name="timeout")
+@commands.has_permissions(moderate_members=True)
+async def timeout_cmd(ctx, member: discord.Member, duration: int, *, reason: str = "No reason provided"):
+    """Timeout a member for *duration* minutes (max 40320 / 28 days)."""
+    if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("❌ You cannot timeout someone with an equal or higher role.")
+        return
+    until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=duration)
+    try:
+        await member.timeout(until, reason=reason)
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have permission to timeout that member.")
+        return
+    embed = discord.Embed(
+        title="⏰ Member Timed Out",
+        description=f"**{member}** has been timed out for **{duration}m**.\n**Reason:** {reason}",
+        color=discord.Color.orange(),
+    )
+    await ctx.send(embed=embed)
+    await _send_modlog(
+        ctx.guild,
+        discord.Embed(
+            title="⏰ Timeout",
+            description=(
+                f"**User:** {member.mention} (`{member}`)\n"
+                f"**By:** {ctx.author.mention}\n"
+                f"**Duration:** {duration} minutes\n"
+                f"**Reason:** {reason}"
+            ),
+            color=discord.Color.orange(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        ).set_footer(text="WondeX Mod-Log"),
+    )
+
+
+@bot.command(name="untimeout")
+@commands.has_permissions(moderate_members=True)
+async def untimeout_cmd(ctx, member: discord.Member):
+    """Remove an active timeout from a member."""
+    try:
+        await member.timeout(None)
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have permission to remove that timeout.")
+        return
+    embed = discord.Embed(
+        title="⏰ Timeout Removed",
+        description=f"**{member}**'s timeout has been lifted.",
+        color=discord.Color.green(),
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="tempmute")
+@commands.has_permissions(manage_roles=True)
+async def tempmute(ctx, member: discord.Member, duration: int, *, reason: str = "No reason provided"):
+    """Mute a member for *duration* minutes, then automatically unmute."""
+    muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
+    if not muted_role:
+        muted_role = await ctx.guild.create_role(name="Muted")
+        for channel in ctx.guild.channels:
+            await channel.set_permissions(muted_role, send_messages=False, speak=False)
+    await member.add_roles(muted_role, reason=reason)
+    embed = discord.Embed(
+        title="🔇 Member Temp-Muted",
+        description=f"**{member}** muted for **{duration}m**.\n**Reason:** {reason}",
+        color=discord.Color.dark_grey(),
+    )
+    await ctx.send(embed=embed)
+
+    async def _auto_unmute():
+        await asyncio.sleep(duration * 60)
+        if muted_role in member.roles:
+            try:
+                await member.remove_roles(muted_role, reason="[Temp-Mute] Duration expired")
+            except discord.HTTPException:
+                pass
+
+    bot.loop.create_task(_auto_unmute())
+    await _send_modlog(
+        ctx.guild,
+        discord.Embed(
+            title="🔇 Temp-Mute",
+            description=(
+                f"**User:** {member.mention} (`{member}`)\n"
+                f"**By:** {ctx.author.mention}\n"
+                f"**Duration:** {duration} minutes\n"
+                f"**Reason:** {reason}"
+            ),
+            color=discord.Color.dark_grey(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        ).set_footer(text="WondeX Mod-Log"),
+    )
+
+
+@bot.command(name="tempban")
+@commands.has_permissions(ban_members=True)
+async def tempban(ctx, member: discord.Member, duration: int, *, reason: str = "No reason provided"):
+    """Ban a member for *duration* minutes, then automatically unban."""
+    await member.ban(reason=f"[Temp-Ban {duration}m] {reason}", delete_message_days=0)
+    embed = discord.Embed(
+        title="⛔ Member Temp-Banned",
+        description=f"**{member}** banned for **{duration}m**.\n**Reason:** {reason}",
+        color=discord.Color.red(),
+    )
+    await ctx.send(embed=embed)
+    user_id = member.id
+    guild = ctx.guild
+
+    async def _auto_unban():
+        await asyncio.sleep(duration * 60)
+        try:
+            await guild.unban(discord.Object(id=user_id), reason="[Temp-Ban] Duration expired")
+        except discord.HTTPException:
+            pass
+
+    bot.loop.create_task(_auto_unban())
+    await _send_modlog(
+        ctx.guild,
+        discord.Embed(
+            title="⛔ Temp-Ban",
+            description=(
+                f"**User:** {member.mention} (`{member}`)\n"
+                f"**By:** {ctx.author.mention}\n"
+                f"**Duration:** {duration} minutes\n"
+                f"**Reason:** {reason}"
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        ).set_footer(text="WondeX Mod-Log"),
+    )
+
+
+@bot.command(name="slowmode")
+@commands.has_permissions(manage_channels=True)
+async def slowmode(ctx, seconds: int = 0):
+    """Set the slowmode delay for the current channel (0 to disable)."""
+    if seconds < 0 or seconds > _MAX_SLOWMODE_SECONDS:
+        await ctx.send(f"❌ Slowmode must be between 0 and {_MAX_SLOWMODE_SECONDS} seconds.")
+        return
+    await ctx.channel.edit(slowmode_delay=seconds)
+    if seconds == 0:
+        await ctx.send("✅ Slowmode **disabled** for this channel.")
+    else:
+        await ctx.send(f"✅ Slowmode set to **{seconds}s** in this channel.")
+
+
+@bot.group(name="role", invoke_without_command=True)
+@commands.has_permissions(manage_roles=True)
+async def role_group(ctx):
+    """Manage roles. Subcommands: add, remove."""
+    await ctx.send("Usage: `Wa!role add @member @role` or `Wa!role remove @member @role`")
+
+
+@role_group.command(name="add")
+@commands.has_permissions(manage_roles=True)
+async def role_add(ctx, member: discord.Member, role: discord.Role):
+    """Add a role to a member."""
+    if role >= ctx.guild.me.top_role:
+        await ctx.send("❌ I cannot assign a role higher than or equal to my own top role.")
+        return
+    await member.add_roles(role, reason=f"Role added by {ctx.author}")
+    await ctx.send(f"✅ Added **{role.name}** to {member.mention}.")
+
+
+@role_group.command(name="remove")
+@commands.has_permissions(manage_roles=True)
+async def role_remove(ctx, member: discord.Member, role: discord.Role):
+    """Remove a role from a member."""
+    if role >= ctx.guild.me.top_role:
+        await ctx.send("❌ I cannot remove a role higher than or equal to my own top role.")
+        return
+    await member.remove_roles(role, reason=f"Role removed by {ctx.author}")
+    await ctx.send(f"✅ Removed **{role.name}** from {member.mention}.")
+
+
+@bot.command(name="nick")
+@commands.has_permissions(manage_nicknames=True)
+async def nick(ctx, member: discord.Member, *, nickname: str = ""):
+    """Change (or reset) a member's nickname."""
+    new_nick = nickname.strip() or None
+    try:
+        await member.edit(nick=new_nick, reason=f"Nick changed by {ctx.author}")
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have permission to change that member's nickname.")
+        return
+    if new_nick:
+        await ctx.send(f"✅ Set **{member}**'s nickname to `{new_nick}`.")
+    else:
+        await ctx.send(f"✅ Reset **{member}**'s nickname.")
+
+
+@bot.command(name="setlogchannel")
+@commands.has_permissions(administrator=True)
+async def setlogchannel(ctx, channel: discord.TextChannel = None):
+    """Set the mod-log channel. Leave blank to use the current channel."""
+    target = channel or ctx.channel
+    _modlog_channels[ctx.guild.id] = target.id
+    await ctx.send(f"✅ Mod-log channel set to {target.mention}.")
+
+
+@bot.command(name="warnings")
+@commands.has_permissions(manage_messages=True)
+async def warnings_cmd(ctx, member: discord.Member):
+    """Show all warnings for a member."""
+    warns = _warnings[ctx.guild.id][member.id]
+    if not warns:
+        await ctx.send(f"{member.mention} has no warnings.")
+        return
+    desc = "\n".join(f"`{i + 1}.` {r}" for i, r in enumerate(warns))
+    embed = discord.Embed(
+        title=f"⚠️ Warnings for {member}",
+        description=desc,
+        color=discord.Color.yellow(),
+    )
+    embed.set_footer(text=f"Total: {len(warns)} warning(s)")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="clearwarns")
+@commands.has_permissions(manage_messages=True)
+async def clearwarns(ctx, member: discord.Member):
+    """Clear all warnings for a member."""
+    _warnings[ctx.guild.id][member.id].clear()
+    await ctx.send(f"✅ Cleared all warnings for {member.mention}.")
+
+
+@bot.group(name="autorole", invoke_without_command=True)
+@commands.has_permissions(manage_roles=True)
+async def autorole_group(ctx):
+    """Configure the auto-role assigned to new members."""
+    role_id = _autorole.get(ctx.guild.id)
+    if role_id:
+        role = ctx.guild.get_role(role_id)
+        await ctx.send(f"Current auto-role: **{role.name if role else 'Role no longer exists (invalid ID)'}**")
+    else:
+        await ctx.send("No auto-role configured. Use `Wa!autorole set @role`.")
+
+
+@autorole_group.command(name="set")
+@commands.has_permissions(manage_roles=True)
+async def autorole_set(ctx, role: discord.Role):
+    """Set the role automatically assigned to new members."""
+    _autorole[ctx.guild.id] = role.id
+    await ctx.send(f"✅ Auto-role set to **{role.name}**.")
+
+
+@autorole_group.command(name="remove")
+@commands.has_permissions(manage_roles=True)
+async def autorole_remove(ctx):
+    """Remove the configured auto-role."""
+    _autorole.pop(ctx.guild.id, None)
+    await ctx.send("✅ Auto-role removed.")
+
+
+@bot.group(name="antiinvite", invoke_without_command=True)
+@commands.has_permissions(administrator=True)
+async def antiinvite_group(ctx):
+    """Show anti-invite status. Subcommands: on, off."""
+    status = "✅ Enabled" if _antiinvite.get(ctx.guild.id) else "❌ Disabled"
+    await ctx.send(f"Anti-invite is currently: {status}")
+
+
+@antiinvite_group.command(name="on")
+@commands.has_permissions(administrator=True)
+async def antiinvite_on(ctx):
+    """Enable automatic deletion of Discord invite links."""
+    _antiinvite[ctx.guild.id] = True
+    await ctx.send("✅ Anti-invite **enabled**. Invite links will be automatically removed.")
+
+
+@antiinvite_group.command(name="off")
+@commands.has_permissions(administrator=True)
+async def antiinvite_off(ctx):
+    """Disable anti-invite filtering."""
+    _antiinvite[ctx.guild.id] = False
+    await ctx.send("❌ Anti-invite **disabled**.")
 
 
 # ──────────────────────────────────────────────
@@ -618,18 +1124,28 @@ async def help_command(ctx):
             "`Wa!unban <user#tag>`\n"
             "`Wa!mute <member> [reason]`\n"
             "`Wa!unmute <member>`\n"
-            "`Wa!warn <member> [reason]`\n"
-            "`Wa!purge <amount>`"
+            "`Wa!timeout <member> <minutes> [reason]`\n"
+            "`Wa!untimeout <member>`\n"
+            "`Wa!tempmute <member> <minutes> [reason]`\n"
+            "`Wa!tempban <member> <minutes> [reason]`\n"
+            "`Wa!warn <member> [reason]` — auto-mutes at 3, auto-bans at 5\n"
+            "`Wa!warnings <member>`\n"
+            "`Wa!clearwarns <member>`\n"
+            "`Wa!purge <amount>`\n"
+            "`Wa!nick <member> [nickname]`"
         ),
         inline=False,
     )
     embed.add_field(
         name="🛡️ Security",
         value=(
-            "`Wa!lockdown`\n"
-            "`Wa!unlock`\n"
+            "`Wa!lockdown` — lock current channel\n"
+            "`Wa!unlock` — unlock current channel\n"
+            "`Wa!slowmode [seconds]` — set channel slowmode\n"
+            "`Wa!role add/remove @member @role`\n"
             "`Wa!serverinfo`\n"
-            "`Wa!userinfo [member]`"
+            "`Wa!userinfo [member]`\n"
+            "`Wa!setlogchannel [#channel]` — set mod-log channel"
         ),
         inline=False,
     )
@@ -645,11 +1161,22 @@ async def help_command(ctx):
     embed.add_field(
         name="🛡️ Anti-Nuke",
         value=(
-            "`Wa!antinuke` — show current status & thresholds\n"
-            "`Wa!antinuke on` — enable protection\n"
-            "`Wa!antinuke off` — disable protection\n"
-            "`Wa!antinuke whitelist add/remove @user` — manage whitelist\n\n"
-            "**Protects against:** mass ban, mass kick, mass channel/role delete, webhook spam"
+            "`Wa!antinuke` — show status & thresholds\n"
+            "`Wa!antinuke on/off`\n"
+            "`Wa!antinuke whitelist add/remove @user`\n\n"
+            "**Protects:** mass ban, kick, channel/role delete, webhook spam"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🤖 Auto-Moderation",
+        value=(
+            "`Wa!antiinvite on/off` — delete Discord invite links\n"
+            "`Wa!autorole set @role` — auto-assign role on join\n"
+            "`Wa!autorole remove`\n\n"
+            "**Always active when enabled:**\n"
+            "• Anti-spam (5 msg / 5s → auto-mute)\n"
+            "• Anti-raid (10 joins / 10s → full lockdown)"
         ),
         inline=False,
     )
